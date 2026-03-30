@@ -261,14 +261,14 @@ async def main():
                         return
 
                     loss_streak = 0
-                    stake *= 1.5
+                    stake *= 2
 
                 else:
 
                     print("❌ LOSS")
 
                     loss_streak += 1
-                    stake *= 2
+                    stake *= 1.25
                     mode = "UNDER6"
 
             elif mode == "UNDER6":
@@ -299,7 +299,7 @@ async def main():
                     else:
 
                         print("❌ Recovery loss")
-                        stake *= 2
+                        stake *= 1.25
                         loss_streak += 1
 
                 stake = BASE_STAKE
