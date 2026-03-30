@@ -19,7 +19,7 @@ MAX_TRADES = 10
 DURATION = 1
 DURATION_UNIT = "t"
 
-STUDY_TICKS = 25
+STUDY_TICKS = 40
 THRESHOLD = 0.80
 EARLY_SCAN = 0.85
 
@@ -261,14 +261,14 @@ async def main():
                         return
 
                     loss_streak = 0
-                    stake *= 2
+                    stake *= 4
 
                 else:
 
                     print("❌ LOSS")
 
                     loss_streak += 1
-                    stake *= 1.25
+                    stake *= 1
                     mode = "UNDER6"
 
             elif mode == "UNDER6":
@@ -299,7 +299,7 @@ async def main():
                     else:
 
                         print("❌ Recovery loss")
-                        stake *= 1.25
+                        stake *= 1
                         loss_streak += 1
 
                 stake = BASE_STAKE
