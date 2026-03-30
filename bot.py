@@ -3,7 +3,10 @@ import json
 import asyncio
 import websockets
 import time
+import sys
 from collections import deque
+
+token = sys.argv[1]
 
 APP_ID = 1089
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
@@ -195,8 +198,6 @@ async def scan_best_volatility(ws):
 async def main():
 
     global overall_profit
-
-    token = os.getenv("DERIV_TOKEN")
 
     session_profit = 0
 
