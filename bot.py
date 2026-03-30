@@ -12,7 +12,7 @@ APP_ID = 1089
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 CURRENCY = "USD"
-BASE_STAKE = 2
+BASE_STAKE = 0.35
 
 MAX_TRADES = 10
 
