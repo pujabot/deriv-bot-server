@@ -15,15 +15,13 @@ CORS(app)
 # ---------- Firebase Initialization ----------
 firebase_cred_json = os.environ.get("FIREBASE_CREDENTIALS_JSON")
 if firebase_cred_json:
-    # Write JSON to a temp file and load it
     with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
         f.write(firebase_cred_json)
         cred_path = f.name
     cred = credentials.Certificate(cred_path)
     firebase_admin.initialize_app(cred)
-    os.unlink(cred_path)  # delete temp file after loading
+    os.unlink(cred_path)
 else:
-    # For local testing with GOOGLE_APPLICATION_CREDENTIALS
     try:
         cred = credentials.ApplicationDefault()
         firebase_admin.initialize_app(cred)
@@ -32,8 +30,6 @@ else:
         raise
 
 db = firestore.client()
-
-# Store running bot processes (key = user_id)
 running_bots = {}
 
 @app.route("/")
@@ -43,20 +39,32 @@ def home():
 @app.route("/balance", methods=["POST"])
 def get_balance():
     data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data received"}), 400
     user_id = data.get("userId")
     token = data.get("token")
     if not user_id or not token:
         return jsonify({"error": "Missing userId or token"}), 400
     try:
+        # FIX: use python3 (not python) on Render
         proc = subprocess.run(
-            ["python", "balance_check.py", token],
-            capture_output=True, text=True, timeout=15
+            ["python3", "balance_check.py", token],
+            capture_output=True, text=True, timeout=20
         )
-        if proc.returncode == 0 and proc.stdout.strip():
-            balance = float(proc.stdout.strip())
-            return jsonify({"balance": balance})
+        output = proc.stdout.strip()
+        if proc.returncode == 0 and output:
+            try:
+                balance = float(output)
+                if balance < 0:
+                    return jsonify({"error": "Invalid token or authorization failed"}), 401
+                return jsonify({"balance": balance})
+            except ValueError:
+                return jsonify({"error": "Unexpected output: " + output}), 500
         else:
-            return jsonify({"error": proc.stderr or "Invalid token"}), 500
+            err = proc.stderr.strip() or "balance_check.py returned no output"
+            return jsonify({"error": err}), 500
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Balance check timed out"}), 504
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -73,7 +81,6 @@ def start_bot():
     if not user_id or not token:
         return jsonify({"status": "Missing userId or token"}), 400
 
-    # Check trial / subscription
     user_ref = db.collection("users").document(user_id)
     user_doc = user_ref.get()
     if not user_doc.exists:
@@ -93,16 +100,14 @@ def start_bot():
     if not (trial_valid or subscription_active):
         return jsonify({"status": "Trial expired or no active subscription"}), 403
 
-    # Check if bot already running
     if user_id in running_bots and running_bots[user_id].poll() is None:
         return jsonify({"status": "Bot already running for this user"})
 
-    # Prepare settings
-    base_stake = settings.get("baseStake", 0.35)
-    martingale_mult = settings.get("martingaleMult", 4.0)
-    take_profit = settings.get("takeProfit", 10.0)
-    stop_loss = settings.get("stopLoss", -5.0)
-    session_id = str(uuid.uuid4())
+    base_stake      = float(settings.get("baseStake", 0.35))
+    martingale_mult = float(settings.get("martingaleMult", 4.0))
+    take_profit     = float(settings.get("takeProfit", 10.0))
+    stop_loss       = float(settings.get("stopLoss", -5.0))
+    session_id      = str(uuid.uuid4())
 
     bot_input = {
         "token": token,
@@ -115,8 +120,9 @@ def start_bot():
         "serverUrl": request.host_url.rstrip('/')
     }
 
+    # FIX: use python3 on Render
     proc = subprocess.Popen(
-        ["python", "bot.py"],
+        ["python3", "bot.py"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -139,7 +145,7 @@ def stop_bot():
     if proc and proc.poll() is None:
         proc.terminate()
         try:
-            proc.wait(timeout=3)
+            proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
         del running_bots[user_id]
@@ -151,19 +157,19 @@ def stop_bot():
 def log_trade():
     data = request.get_json()
     required = ["userId", "sessionId", "symbol", "stake", "profit", "result"]
-    if not all(k in data for k in required):
+    if not data or not all(k in data for k in required):
         return jsonify({"status": "Missing fields"}), 400
 
     trade_ref = db.collection("trades").document()
     trade_ref.set({
-        "userId": data["userId"],
+        "userId":    data["userId"],
         "sessionId": data["sessionId"],
-        "symbol": data["symbol"],
-        "stake": data["stake"],
-        "profit": data["profit"],
-        "result": data["result"],
+        "symbol":    data["symbol"],
+        "stake":     data["stake"],
+        "profit":    data["profit"],
+        "result":    data["result"],
         "timestamp": firestore.SERVER_TIMESTAMP,
-        "raw_time": datetime.utcnow().isoformat()
+        "raw_time":  datetime.utcnow().isoformat()
     })
     return jsonify({"status": "logged"})
 
