@@ -6,6 +6,7 @@ import requests
 import traceback
 from datetime import datetime
 
+# ---------- Helper: log trade to Flask server ----------
 async def log_trade(server_url, user_id, session_id, symbol, stake, profit, result_str):
     try:
         await asyncio.to_thread(
@@ -25,6 +26,7 @@ async def log_trade(server_url, user_id, session_id, symbol, stake, profit, resu
     except Exception as e:
         print(f"Logging failed: {e}", file=sys.stderr)
 
+# ---------- Main bot logic ----------
 async def main():
     try:
         config_str = sys.stdin.read()
@@ -42,13 +44,19 @@ async def main():
         STOP_LOSS = float(config["stopLoss"])
         SERVER_URL = config["serverUrl"]
 
+        # ---- Fix: stop loss must be negative ----
+        if STOP_LOSS >= 0:
+            STOP_LOSS = -5.0
+            print(f"⚠️ Stop loss was set to non‑negative ({STOP_LOSS}), changed to -5.0", file=sys.stderr)
+
         APP_ID = 1089
         WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
         CURRENCY = "USD"
         DURATION = 1
         DURATION_UNIT = "t"
-        SYMBOL = "1HZ100V"
+        SYMBOL = "1HZ100V"          # You can make this configurable later
 
+        # ---------- WebSocket helpers ----------
         async def send(ws, data):
             await ws.send(json.dumps(data))
 
@@ -92,13 +100,15 @@ async def main():
                 if msg["proposal_open_contract"]["is_sold"]:
                     return float(msg["proposal_open_contract"]["profit"])
 
+        # ---------- Connect to Deriv ----------
         async with websockets.connect(WS_URL) as ws:
+            # Authorize
             await send(ws, {"authorize": TOKEN})
             auth_msg = await wait_msg(ws, "authorize")
             if "error" in auth_msg:
                 print(f"Authorization failed: {auth_msg}", file=sys.stderr)
                 return
-            print("Authorized successfully")
+            print(f"✅ Authorized successfully (user {USER_ID[:6]})")
 
             stake = BASE_STAKE
             session_profit = 0.0
@@ -106,17 +116,20 @@ async def main():
             loss_streak = 0
             mode = "OVER2"
 
+            # ---------- Trading loop ----------
             while True:
+                # Check profit targets
                 if session_profit >= TAKE_PROFIT:
-                    print(f"Take profit reached: ${session_profit:.2f}")
+                    print(f"✅ Take profit reached: ${session_profit:.2f}")
                     break
                 if session_profit <= STOP_LOSS:
-                    print(f"Stop loss hit: ${session_profit:.2f}")
+                    print(f"🛑 Stop loss hit: ${session_profit:.2f}")
                     break
                 if loss_streak >= 6:
-                    print("Too many consecutive losses, stopping.")
+                    print("❌ Too many consecutive losses, stopping.")
                     break
 
+                # ---------- OVER2 trades ----------
                 if mode == "OVER2":
                     cid = await buy(ws, stake, "DIGITOVER", "2")
                     profit = await get_result(ws, cid)
@@ -124,16 +137,19 @@ async def main():
                     trade_count += 1
                     result_str = "WIN" if profit > 0 else "LOSS"
                     await log_trade(SERVER_URL, USER_ID, SESSION_ID, SYMBOL, stake, profit, result_str)
-                    print(f"Trade {trade_count} [{result_str}]: profit ${profit:.2f} | session ${session_profit:.2f} | stake ${stake:.2f}")
+                    print(f"📊 Trade {trade_count} [{result_str}]: profit ${profit:.2f} | session ${session_profit:.2f} | stake ${stake:.2f}")
 
                     if profit > 0:
+                        # Reset on win
                         stake = BASE_STAKE
                         loss_streak = 0
                     else:
+                        # Loss -> switch to recovery mode and increase stake
                         stake *= MARTINGALE_MULT
                         loss_streak += 1
                         mode = "UNDER6"
 
+                # ---------- Recovery trades (UNDER6) ----------
                 elif mode == "UNDER6":
                     for _ in range(3):
                         cid = await buy(ws, stake, "DIGITUNDER", "6")
@@ -142,24 +158,27 @@ async def main():
                         trade_count += 1
                         result_str = "WIN" if profit > 0 else "LOSS"
                         await log_trade(SERVER_URL, USER_ID, SESSION_ID, SYMBOL, stake, profit, result_str)
-                        print(f"Recovery [{result_str}]: profit ${profit:.2f} | session ${session_profit:.2f}")
+                        print(f"🔄 Recovery trade [{result_str}]: profit ${profit:.2f} | session ${session_profit:.2f}")
 
                         if profit > 0:
+                            # Recovery succeeded
                             stake = BASE_STAKE
                             loss_streak = 0
                             break
                         else:
+                            # Recovery loss – increase stake and continue
                             stake *= MARTINGALE_MULT
                             loss_streak += 1
                             if loss_streak >= 6:
                                 break
 
+                    # Always go back to OVER2 after recovery attempts
                     mode = "OVER2"
 
-            print(f"Bot finished. Final session profit: ${session_profit:.2f}")
+            print(f"🏁 Bot finished. Final session profit: ${session_profit:.2f}")
 
     except Exception as e:
-        print(f"FATAL ERROR: {e}", file=sys.stderr)
+        print(f"💥 FATAL ERROR: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
 
 if __name__ == "__main__":
