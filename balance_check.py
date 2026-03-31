@@ -16,7 +16,8 @@ async def get_balance(token):
             bal_resp = await ws.recv()
             bal_data = json.loads(bal_resp)
             return bal_data.get("balance", {}).get("balance", 0)
-    except:
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
         return -1
 
 if __name__ == "__main__":
