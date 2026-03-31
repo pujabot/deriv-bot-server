@@ -2,6 +2,7 @@ import os
 import json
 import subprocess
 import uuid
+import tempfile
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -11,32 +12,60 @@ from firebase_admin import credentials, firestore
 app = Flask(__name__)
 CORS(app)
 
-# Initialize Firebase Admin SDK
-# Make sure to set environment variable GOOGLE_APPLICATION_CREDENTIALS
-cred = credentials.ApplicationDefault()
-if not cred:
-    # Fallback: try to load from file (for local testing)
+# ---------- Firebase Initialization ----------
+firebase_cred_json = os.environ.get("FIREBASE_CREDENTIALS_JSON")
+if firebase_cred_json:
+    # Write JSON to a temp file and load it
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        f.write(firebase_cred_json)
+        cred_path = f.name
+    cred = credentials.Certificate(cred_path)
+    firebase_admin.initialize_app(cred)
+    os.unlink(cred_path)  # delete temp file after loading
+else:
+    # For local testing with GOOGLE_APPLICATION_CREDENTIALS
     try:
-        cred = credentials.Certificate("firebase-adminsdk.json")
-    except:
-        print("ERROR: No Firebase credentials found. Set GOOGLE_APPLICATION_CREDENTIALS.")
-firebase_admin.initialize_app(cred)
+        cred = credentials.ApplicationDefault()
+        firebase_admin.initialize_app(cred)
+    except Exception as e:
+        print("ERROR: No Firebase credentials. Set FIREBASE_CREDENTIALS_JSON env var.")
+        raise
+
 db = firestore.client()
 
-# Store running bot processes (in production use a proper task queue)
-# key = userId, value = subprocess.Popen
+# Store running bot processes (key = user_id)
 running_bots = {}
 
 @app.route("/")
 def home():
     return "Deriv Bot Server Running"
 
+@app.route("/balance", methods=["POST"])
+def get_balance():
+    data = request.get_json()
+    user_id = data.get("userId")
+    token = data.get("token")
+    if not user_id or not token:
+        return jsonify({"error": "Missing userId or token"}), 400
+    try:
+        proc = subprocess.run(
+            ["python", "balance_check.py", token],
+            capture_output=True, text=True, timeout=15
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            balance = float(proc.stdout.strip())
+            return jsonify({"balance": balance})
+        else:
+            return jsonify({"error": proc.stderr or "Invalid token"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/start", methods=["POST"])
 def start_bot():
     data = request.get_json()
     if not data:
         return jsonify({"status": "Invalid request"}), 400
-    
+
     user_id = data.get("userId")
     token = data.get("token")
     settings = data.get("settings", {})
@@ -49,7 +78,7 @@ def start_bot():
     user_doc = user_ref.get()
     if not user_doc.exists:
         return jsonify({"status": "User not found"}), 404
-    
+
     user_data = user_doc.to_dict()
     trial_expiry_str = user_data.get("trialExpiry")
     subscription_active = user_data.get("subscriptionActive", False)
@@ -62,22 +91,19 @@ def start_bot():
             trial_valid = True
 
     if not (trial_valid or subscription_active):
-        return jsonify({"status": "Trial expired or no active subscription. Please subscribe."}), 403
+        return jsonify({"status": "Trial expired or no active subscription"}), 403
 
-    # Check if bot already running for this user
+    # Check if bot already running
     if user_id in running_bots and running_bots[user_id].poll() is None:
         return jsonify({"status": "Bot already running for this user"})
 
-    # Prepare settings with defaults
+    # Prepare settings
     base_stake = settings.get("baseStake", 0.35)
     martingale_mult = settings.get("martingaleMult", 4.0)
     take_profit = settings.get("takeProfit", 10.0)
     stop_loss = settings.get("stopLoss", -5.0)
-
-    # Create a unique session ID
     session_id = str(uuid.uuid4())
 
-    # Launch bot.py as subprocess, pass all data as JSON
     bot_input = {
         "token": token,
         "userId": user_id,
@@ -86,9 +112,9 @@ def start_bot():
         "martingaleMult": martingale_mult,
         "takeProfit": take_profit,
         "stopLoss": stop_loss,
-        "serverUrl": request.host_url.rstrip('/')  # so bot can call back
+        "serverUrl": request.host_url.rstrip('/')
     }
-    # Use stdin to pass config to avoid command line length limits
+
     proc = subprocess.Popen(
         ["python", "bot.py"],
         stdin=subprocess.PIPE,
@@ -100,7 +126,7 @@ def start_bot():
     proc.stdin.close()
     running_bots[user_id] = proc
 
-    return jsonify({"status": f"Bot started for session {session_id}"})
+    return jsonify({"status": f"Bot started (session {session_id})"})
 
 @app.route("/stop", methods=["POST"])
 def stop_bot():
@@ -108,11 +134,10 @@ def stop_bot():
     user_id = data.get("userId") if data else None
     if not user_id:
         return jsonify({"status": "Missing userId"}), 400
-    
+
     proc = running_bots.get(user_id)
     if proc and proc.poll() is None:
         proc.terminate()
-        # Wait a bit then force kill if needed
         try:
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
@@ -124,13 +149,11 @@ def stop_bot():
 
 @app.route("/log_trade", methods=["POST"])
 def log_trade():
-    """Endpoint for bot.py to report trade results"""
     data = request.get_json()
-    required = ["userId", "sessionId", "symbol", "stake", "profit", "result", "timestamp"]
+    required = ["userId", "sessionId", "symbol", "stake", "profit", "result"]
     if not all(k in data for k in required):
         return jsonify({"status": "Missing fields"}), 400
-    
-    # Store trade in Firestore
+
     trade_ref = db.collection("trades").document()
     trade_ref.set({
         "userId": data["userId"],
@@ -140,7 +163,7 @@ def log_trade():
         "profit": data["profit"],
         "result": data["result"],
         "timestamp": firestore.SERVER_TIMESTAMP,
-        "raw_time": data["timestamp"]
+        "raw_time": datetime.utcnow().isoformat()
     })
     return jsonify({"status": "logged"})
 
