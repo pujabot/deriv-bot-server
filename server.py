@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import subprocess
 import uuid
@@ -21,7 +22,7 @@ CORS(app, resources={r"/*": {
 def handle_preflight():
     if request.method == "OPTIONS":
         res = app.make_default_options_response()
-        res.headers["Access-Control-Allow-Origin"]  = "*"
+        res.headers["Access-Control-Allow-Origin"] = "*"
         res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         return res
@@ -29,7 +30,7 @@ def handle_preflight():
 def cors_response(data, status=200):
     res = jsonify(data)
     res.status_code = status
-    res.headers["Access-Control-Allow-Origin"]  = "*"
+    res.headers["Access-Control-Allow-Origin"] = "*"
     res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return res
@@ -66,12 +67,12 @@ def get_balance():
     if not data:
         return cors_response({"error": "No data received"}, 400)
     user_id = data.get("userId")
-    token   = data.get("token")
+    token = data.get("token")
     if not user_id or not token:
         return cors_response({"error": "Missing userId or token"}, 400)
     try:
         proc = subprocess.run(
-            ["python3", "balance_check.py", token],
+            [sys.executable, "balance_check.py", token],
             capture_output=True, text=True, timeout=20
         )
         output = proc.stdout.strip()
@@ -99,8 +100,8 @@ def start_bot():
     if not data:
         return cors_response({"status": "Invalid request"}, 400)
 
-    user_id  = data.get("userId")
-    token    = data.get("token")
+    user_id = data.get("userId")
+    token = data.get("token")
     settings = data.get("settings", {})
 
     if not user_id or not token:
@@ -111,17 +112,15 @@ def start_bot():
     if not user_doc.exists:
         return cors_response({"status": "User not found"}, 404)
 
-    user_data           = user_doc.to_dict()
-    trial_expiry_str    = user_data.get("trialExpiry")
+    user_data = user_doc.to_dict()
+    trial_expiry_str = user_data.get("trialExpiry")
     subscription_active = user_data.get("subscriptionActive", False)
 
-    # FIX: use timezone-aware datetime for comparison
-    now         = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
     trial_valid = False
     if trial_expiry_str:
         try:
             trial_expiry = datetime.fromisoformat(trial_expiry_str)
-            # If the stored datetime has no timezone, treat it as UTC
             if trial_expiry.tzinfo is None:
                 trial_expiry = trial_expiry.replace(tzinfo=timezone.utc)
             if now < trial_expiry:
@@ -135,25 +134,25 @@ def start_bot():
     if user_id in running_bots and running_bots[user_id].poll() is None:
         return cors_response({"status": "Bot already running for this user"})
 
-    base_stake      = float(settings.get("baseStake", 0.35))
+    base_stake = float(settings.get("baseStake", 0.35))
     martingale_mult = float(settings.get("martingaleMult", 4.0))
-    take_profit     = float(settings.get("takeProfit", 10.0))
-    stop_loss       = float(settings.get("stopLoss", -5.0))
-    session_id      = str(uuid.uuid4())
+    take_profit = float(settings.get("takeProfit", 10.0))
+    stop_loss = float(settings.get("stopLoss", -5.0))
+    session_id = str(uuid.uuid4())
 
     bot_input = {
-        "token":          token,
-        "userId":         user_id,
-        "sessionId":      session_id,
-        "baseStake":      base_stake,
+        "token": token,
+        "userId": user_id,
+        "sessionId": session_id,
+        "baseStake": base_stake,
         "martingaleMult": martingale_mult,
-        "takeProfit":     take_profit,
-        "stopLoss":       stop_loss,
-        "serverUrl":      request.host_url.rstrip('/')
+        "takeProfit": take_profit,
+        "stopLoss": stop_loss,
+        "serverUrl": request.host_url.rstrip('/')
     }
 
     proc = subprocess.Popen(
-        ["python3", "bot.py"],
+        [sys.executable, "bot.py"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -161,15 +160,25 @@ def start_bot():
     )
     proc.stdin.write(json.dumps(bot_input))
     proc.stdin.close()
-    running_bots[user_id] = proc
 
+    # Start a thread to capture stderr and print it (so Render logs show errors)
+    def log_stderr():
+        for line in iter(proc.stderr.readline, ''):
+            print(f"[BOT ERR] {line.strip()}", flush=True)
+        proc.stderr.close()
+    import threading
+    t = threading.Thread(target=log_stderr)
+    t.daemon = True
+    t.start()
+
+    running_bots[user_id] = proc
     return cors_response({"status": f"Bot started (session {session_id})"})
 
 @app.route("/stop", methods=["POST", "OPTIONS"])
 def stop_bot():
     if request.method == "OPTIONS":
         return cors_response({})
-    data    = request.get_json()
+    data = request.get_json()
     user_id = data.get("userId") if data else None
     if not user_id:
         return cors_response({"status": "Missing userId"}, 400)
@@ -190,21 +199,21 @@ def stop_bot():
 def log_trade():
     if request.method == "OPTIONS":
         return cors_response({})
-    data     = request.get_json()
+    data = request.get_json()
     required = ["userId", "sessionId", "symbol", "stake", "profit", "result"]
     if not data or not all(k in data for k in required):
         return cors_response({"status": "Missing fields"}, 400)
 
     trade_ref = db.collection("trades").document()
     trade_ref.set({
-        "userId":    data["userId"],
+        "userId": data["userId"],
         "sessionId": data["sessionId"],
-        "symbol":    data["symbol"],
-        "stake":     data["stake"],
-        "profit":    data["profit"],
-        "result":    data["result"],
+        "symbol": data["symbol"],
+        "stake": data["stake"],
+        "profit": data["profit"],
+        "result": data["result"],
         "timestamp": firestore.SERVER_TIMESTAMP,
-        "raw_time":  datetime.now(timezone.utc).isoformat()
+        "raw_time": datetime.now(timezone.utc).isoformat()
     })
     return cors_response({"status": "logged"})
 
