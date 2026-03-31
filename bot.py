@@ -4,7 +4,7 @@ import asyncio
 import websockets
 import requests
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ---------- Helper: log trade to Flask server ----------
 async def log_trade(server_url, user_id, session_id, symbol, stake, profit, result_str):
@@ -19,167 +19,181 @@ async def log_trade(server_url, user_id, session_id, symbol, stake, profit, resu
                 "stake": stake,
                 "profit": profit,
                 "result": result_str,
-                "raw_time": datetime.utcnow().isoformat()
+                "raw_time": datetime.now(timezone.utc).isoformat()
             },
             timeout=5
         )
     except Exception as e:
         print(f"Logging failed: {e}", file=sys.stderr)
 
-# ---------- Main bot logic ----------
-async def main():
-    try:
-        config_str = sys.stdin.read()
-        if not config_str:
-            print("No config received", file=sys.stderr)
+# ---------- Main bot logic (runs a single session) ----------
+async def run_session(config):
+    TOKEN = config["token"]
+    USER_ID = config["userId"]
+    SESSION_ID = config["sessionId"]
+    BASE_STAKE = float(config["baseStake"])
+    MARTINGALE_MULT = float(config["martingaleMult"])
+    TAKE_PROFIT = float(config["takeProfit"])
+    STOP_LOSS = float(config["stopLoss"])
+    SERVER_URL = config["serverUrl"]
+
+    # Ensure stop loss is negative
+    if STOP_LOSS >= 0:
+        STOP_LOSS = -5.0
+        print(f"⚠️ Stop loss was set to non‑negative, changed to -5.0", file=sys.stderr)
+
+    APP_ID = 1089
+    WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+    CURRENCY = "USD"
+    DURATION = 1
+    DURATION_UNIT = "t"
+    SYMBOL = "1HZ100V"          # You can make this configurable later
+
+    # ---------- WebSocket helpers ----------
+    async def send(ws, data):
+        await ws.send(json.dumps(data))
+
+    async def recv(ws):
+        return json.loads(await ws.recv())
+
+    async def wait_msg(ws, msg_type):
+        while True:
+            msg = await recv(ws)
+            if "error" in msg:
+                print(f"API ERROR: {msg}", file=sys.stderr)
+            if msg.get("msg_type") == msg_type:
+                return msg
+
+    async def buy(ws, amount, ctype, barrier):
+        await send(ws, {
+            "proposal": 1,
+            "amount": amount,
+            "basis": "stake",
+            "contract_type": ctype,
+            "currency": CURRENCY,
+            "duration": DURATION,
+            "duration_unit": DURATION_UNIT,
+            "symbol": SYMBOL,
+            "barrier": str(barrier)
+        })
+        proposal = await wait_msg(ws, "proposal")
+        pid = proposal["proposal"]["id"]
+        await send(ws, {"buy": pid, "price": amount})
+        buy_msg = await wait_msg(ws, "buy")
+        return buy_msg["buy"]["contract_id"]
+
+    async def get_result(ws, cid):
+        await send(ws, {
+            "proposal_open_contract": 1,
+            "contract_id": cid,
+            "subscribe": 1
+        })
+        while True:
+            msg = await wait_msg(ws, "proposal_open_contract")
+            if msg["proposal_open_contract"]["is_sold"]:
+                return float(msg["proposal_open_contract"]["profit"])
+
+    # ---------- Connect to Deriv ----------
+    async with websockets.connect(WS_URL) as ws:
+        # Authorize
+        await send(ws, {"authorize": TOKEN})
+        auth_msg = await wait_msg(ws, "authorize")
+        if "error" in auth_msg:
+            print(f"Authorization failed: {auth_msg}", file=sys.stderr)
             return
-        config = json.loads(config_str)
+        print(f"✅ Authorized successfully (user {USER_ID[:6]})")
 
-        TOKEN = config["token"]
-        USER_ID = config["userId"]
-        SESSION_ID = config["sessionId"]
-        BASE_STAKE = float(config["baseStake"])
-        MARTINGALE_MULT = float(config["martingaleMult"])
-        TAKE_PROFIT = float(config["takeProfit"])
-        STOP_LOSS = float(config["stopLoss"])
-        SERVER_URL = config["serverUrl"]
+        stake = BASE_STAKE
+        session_profit = 0.0
+        trade_count = 0
+        loss_streak = 0
+        mode = "OVER2"
 
-        # ---- Fix: stop loss must be negative ----
-        if STOP_LOSS >= 0:
-            STOP_LOSS = -5.0
-            print(f"⚠️ Stop loss was set to non‑negative ({STOP_LOSS}), changed to -5.0", file=sys.stderr)
+        # ---------- Trading loop ----------
+        while True:
+            # Check profit targets
+            if session_profit >= TAKE_PROFIT:
+                print(f"✅ Take profit reached: ${session_profit:.2f}")
+                break
+            if session_profit <= STOP_LOSS:
+                print(f"🛑 Stop loss hit: ${session_profit:.2f}")
+                break
+            if loss_streak >= 6:
+                print("❌ Too many consecutive losses, stopping.")
+                break
 
-        APP_ID = 1089
-        WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-        CURRENCY = "USD"
-        DURATION = 1
-        DURATION_UNIT = "t"
-        SYMBOL = "1HZ100V"          # You can make this configurable later
+            # ---------- OVER2 trades ----------
+            if mode == "OVER2":
+                cid = await buy(ws, stake, "DIGITOVER", "2")
+                profit = await get_result(ws, cid)
+                session_profit += profit
+                trade_count += 1
+                result_str = "WIN" if profit > 0 else "LOSS"
+                await log_trade(SERVER_URL, USER_ID, SESSION_ID, SYMBOL, stake, profit, result_str)
+                print(f"📊 Trade {trade_count} [{result_str}]: profit ${profit:.2f} | session ${session_profit:.2f} | stake ${stake:.2f}")
 
-        # ---------- WebSocket helpers ----------
-        async def send(ws, data):
-            await ws.send(json.dumps(data))
+                if profit > 0:
+                    # Reset on win
+                    stake = BASE_STAKE
+                    loss_streak = 0
+                else:
+                    # Loss -> switch to recovery mode and increase stake
+                    stake *= MARTINGALE_MULT
+                    loss_streak += 1
+                    mode = "UNDER6"
 
-        async def recv(ws):
-            return json.loads(await ws.recv())
-
-        async def wait_msg(ws, msg_type):
-            while True:
-                msg = await recv(ws)
-                if "error" in msg:
-                    print(f"API ERROR: {msg}", file=sys.stderr)
-                if msg.get("msg_type") == msg_type:
-                    return msg
-
-        async def buy(ws, amount, ctype, barrier):
-            await send(ws, {
-                "proposal": 1,
-                "amount": amount,
-                "basis": "stake",
-                "contract_type": ctype,
-                "currency": CURRENCY,
-                "duration": DURATION,
-                "duration_unit": DURATION_UNIT,
-                "symbol": SYMBOL,
-                "barrier": str(barrier)
-            })
-            proposal = await wait_msg(ws, "proposal")
-            pid = proposal["proposal"]["id"]
-            await send(ws, {"buy": pid, "price": amount})
-            buy_msg = await wait_msg(ws, "buy")
-            return buy_msg["buy"]["contract_id"]
-
-        async def get_result(ws, cid):
-            await send(ws, {
-                "proposal_open_contract": 1,
-                "contract_id": cid,
-                "subscribe": 1
-            })
-            while True:
-                msg = await wait_msg(ws, "proposal_open_contract")
-                if msg["proposal_open_contract"]["is_sold"]:
-                    return float(msg["proposal_open_contract"]["profit"])
-
-        # ---------- Connect to Deriv ----------
-        async with websockets.connect(WS_URL) as ws:
-            # Authorize
-            await send(ws, {"authorize": TOKEN})
-            auth_msg = await wait_msg(ws, "authorize")
-            if "error" in auth_msg:
-                print(f"Authorization failed: {auth_msg}", file=sys.stderr)
-                return
-            print(f"✅ Authorized successfully (user {USER_ID[:6]})")
-
-            stake = BASE_STAKE
-            session_profit = 0.0
-            trade_count = 0
-            loss_streak = 0
-            mode = "OVER2"
-
-            # ---------- Trading loop ----------
-            while True:
-                # Check profit targets
-                if session_profit >= TAKE_PROFIT:
-                    print(f"✅ Take profit reached: ${session_profit:.2f}")
-                    break
-                if session_profit <= STOP_LOSS:
-                    print(f"🛑 Stop loss hit: ${session_profit:.2f}")
-                    break
-                if loss_streak >= 6:
-                    print("❌ Too many consecutive losses, stopping.")
-                    break
-
-                # ---------- OVER2 trades ----------
-                if mode == "OVER2":
-                    cid = await buy(ws, stake, "DIGITOVER", "2")
+            # ---------- Recovery trades (UNDER6) ----------
+            elif mode == "UNDER6":
+                for _ in range(3):
+                    cid = await buy(ws, stake, "DIGITUNDER", "6")
                     profit = await get_result(ws, cid)
                     session_profit += profit
                     trade_count += 1
                     result_str = "WIN" if profit > 0 else "LOSS"
                     await log_trade(SERVER_URL, USER_ID, SESSION_ID, SYMBOL, stake, profit, result_str)
-                    print(f"📊 Trade {trade_count} [{result_str}]: profit ${profit:.2f} | session ${session_profit:.2f} | stake ${stake:.2f}")
+                    print(f"🔄 Recovery trade [{result_str}]: profit ${profit:.2f} | session ${session_profit:.2f}")
 
                     if profit > 0:
-                        # Reset on win
+                        # Recovery succeeded
                         stake = BASE_STAKE
                         loss_streak = 0
+                        break
                     else:
-                        # Loss -> switch to recovery mode and increase stake
+                        # Recovery loss – increase stake and continue
                         stake *= MARTINGALE_MULT
                         loss_streak += 1
-                        mode = "UNDER6"
-
-                # ---------- Recovery trades (UNDER6) ----------
-                elif mode == "UNDER6":
-                    for _ in range(3):
-                        cid = await buy(ws, stake, "DIGITUNDER", "6")
-                        profit = await get_result(ws, cid)
-                        session_profit += profit
-                        trade_count += 1
-                        result_str = "WIN" if profit > 0 else "LOSS"
-                        await log_trade(SERVER_URL, USER_ID, SESSION_ID, SYMBOL, stake, profit, result_str)
-                        print(f"🔄 Recovery trade [{result_str}]: profit ${profit:.2f} | session ${session_profit:.2f}")
-
-                        if profit > 0:
-                            # Recovery succeeded
-                            stake = BASE_STAKE
-                            loss_streak = 0
+                        if loss_streak >= 6:
                             break
-                        else:
-                            # Recovery loss – increase stake and continue
-                            stake *= MARTINGALE_MULT
-                            loss_streak += 1
-                            if loss_streak >= 6:
-                                break
 
-                    # Always go back to OVER2 after recovery attempts
-                    mode = "OVER2"
+                # Always go back to OVER2 after recovery attempts
+                mode = "OVER2"
 
-            print(f"🏁 Bot finished. Final session profit: ${session_profit:.2f}")
+        print(f"🏁 Session finished. Final profit: ${session_profit:.2f}")
 
-    except Exception as e:
-        print(f"💥 FATAL ERROR: {e}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
+# ---------- Wrapper with auto‑reconnect ----------
+async def main():
+    config_str = sys.stdin.read()
+    if not config_str:
+        print("No config received", file=sys.stderr)
+        return
+    config = json.loads(config_str)
+
+    # Keep reconnecting if the connection drops
+    while True:
+        try:
+            await run_session(config)
+            print("Bot session completed normally.")
+            break  # exit if session finished cleanly (take profit / stop loss / max losses)
+        except (websockets.exceptions.ConnectionClosedError,
+                websockets.exceptions.ConnectionClosedOK,
+                ConnectionResetError) as e:
+            print(f"🔌 Connection lost ({e}). Reconnecting in 5 seconds...", file=sys.stderr)
+            await asyncio.sleep(5)
+        except Exception as e:
+            print(f"💥 Unexpected error: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            print("Restarting in 10 seconds...", file=sys.stderr)
+            await asyncio.sleep(10)
 
 if __name__ == "__main__":
     asyncio.run(main())
