@@ -5,6 +5,7 @@ import websockets
 import requests
 import traceback
 from datetime import datetime, timezone
+from collections import deque
 
 # ---------- Helper: log trade to Flask server ----------
 async def log_trade(server_url, user_id, session_id, symbol, stake, profit, result_str):
@@ -26,8 +27,38 @@ async def log_trade(server_url, user_id, session_id, symbol, stake, profit, resu
     except Exception as e:
         print(f"Logging failed: {e}", file=sys.stderr)
 
+# ---------- Strategy helpers ----------
+def last_digit(price):
+    """Return the last digit of a price (ignoring decimal point)."""
+    return int(str(price).replace(".", "")[-1])
+
+def check_momentum(digits):
+    """Return True if at least 4 of the last MOMENTUM_TICKS digits are >2."""
+    MOMENTUM_TICKS = 5
+    last = digits[-MOMENTUM_TICKS:]
+    return sum(1 for d in last if d > 2) >= 4
+
+def digit_pressure(digits):
+    """Return (count_over2, count_under2) for the last PRESSURE_TICKS ticks."""
+    PRESSURE_TICKS = 10
+    sample = digits[-PRESSURE_TICKS:]
+    over = sum(1 for d in sample if d > 2)
+    under = sum(1 for d in sample if d <= 2)
+    return over, under
+
+def dashboard(name, percent, momentum, over, under):
+    """Print a nice dashboard of the current symbol analysis."""
+    print("\n" + "="*40)
+    print(f"📊 SYMBOL: {name}")
+    print(f"📈 Strength: {percent*100:.2f}%")
+    print(f"⚡ Momentum: {'✅' if momentum else '❌'}")
+    print(f"🔥 >2 Pressure: {over}")
+    print(f"❄️ ≤2 Pressure: {under}")
+    print("="*40)
+
 # ---------- Main bot logic (runs a single session) ----------
 async def run_session(config):
+    # ----- Read configuration -----
     TOKEN = config["token"]
     USER_ID = config["userId"]
     SESSION_ID = config["sessionId"]
@@ -42,14 +73,29 @@ async def run_session(config):
         STOP_LOSS = -5.0
         print(f"⚠️ Stop loss was set to non‑negative, changed to -5.0", file=sys.stderr)
 
+    # ----- Constants -----
     APP_ID = 1089
     WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
     CURRENCY = "USD"
     DURATION = 1
     DURATION_UNIT = "t"
-    SYMBOL = "1HZ100V"          # You can make this configurable later
 
-    # ---------- WebSocket helpers ----------
+    # Symbol list (same as your strategy)
+    SYMBOLS = {
+        "V10": "1HZ10V",
+        "V25": "1HZ25V",
+        "V50": "1HZ50V",
+        "V75": "1HZ75V",
+        "V100": "1HZ100V"
+    }
+
+    # Strategy parameters derived from settings
+    FIRST_STAKE = BASE_STAKE
+    SECOND_STAKE = BASE_STAKE * 2          # You can adjust this factor later
+    RECOVERY_MULTIPLIER = MARTINGALE_MULT   # recovery stake multiplier
+    RECOVERY_STEPS = 6                     # max recovery attempts
+
+    # ----- WebSocket helpers (shared with the strategy) -----
     async def send(ws, data):
         await ws.send(json.dumps(data))
 
@@ -73,7 +119,7 @@ async def run_session(config):
             "currency": CURRENCY,
             "duration": DURATION,
             "duration_unit": DURATION_UNIT,
-            "symbol": SYMBOL,
+            "symbol": symbol,          # symbol is captured from outer scope
             "barrier": str(barrier)
         })
         proposal = await wait_msg(ws, "proposal")
@@ -93,7 +139,55 @@ async def run_session(config):
             if msg["proposal_open_contract"]["is_sold"]:
                 return float(msg["proposal_open_contract"]["profit"])
 
-    # ---------- Connect to Deriv ----------
+    # ----- Strategy-specific functions (use the helpers above) -----
+    async def study_symbol(ws, sym):
+        """Collect STUDY_TICKS ticks and return (over2_percentage, digits_list)."""
+        STUDY_TICKS = 25
+        await send(ws, {"ticks": sym, "subscribe": 1})
+        digits = []
+        while len(digits) < STUDY_TICKS:
+            tick = await wait_msg(ws, "tick")
+            digits.append(last_digit(tick["tick"]["quote"]))
+        await send(ws, {"forget_all": "ticks"})
+        over2 = sum(1 for d in digits if d > 2)
+        percent = over2 / STUDY_TICKS
+        return percent, digits
+
+    async def find_entry(ws):
+        """Scan symbols and return (name, symbol) when a good setup is found."""
+        print("\n🔍 Scanning Market...")
+        while True:
+            for name, sym in SYMBOLS.items():
+                percent, digits = await study_symbol(ws, sym)
+                momentum = check_momentum(digits)
+                over, under = digit_pressure(digits)
+                dashboard(name, percent, momentum, over, under)
+
+                # Entry condition: strength between thresholds, momentum strong, >2 pressure > ≤2 pressure
+                MIN_THRESHOLD = 0.78
+                MAX_THRESHOLD = 0.86
+                if MIN_THRESHOLD <= percent <= MAX_THRESHOLD and momentum and over > under:
+                    print(f"🚀 ENTRY → {name}")
+                    return name, sym
+            print("⏳ No setup → rescanning...\n")
+
+    async def smart_recovery(ws, symbol):
+        """Attempt up to RECOVERY_STEPS trades with increasing stake (OVER 4)."""
+        print("🧠 Smart Recovery Mode (OVER 4)")
+        stake = SECOND_STAKE * RECOVERY_MULTIPLIER
+        for i in range(RECOVERY_STEPS):
+            print(f"🛠 Recovery {i+1} | Stake: {stake}")
+            # Use the existing buy and get_result functions, but with symbol from outer scope
+            cid = await buy(ws, stake, "DIGITOVER", 4)
+            profit = await get_result(ws, cid)
+            if profit > 0:
+                print("✅ Recovery win\n")
+                return profit, stake
+            stake *= RECOVERY_MULTIPLIER
+        print("❌ Recovery ended (no win after all attempts)\n")
+        return 0, 0   # no profit
+
+    # ----- Connect and start trading -----
     async with websockets.connect(WS_URL) as ws:
         # Authorize
         await send(ws, {"authorize": TOKEN})
@@ -103,74 +197,71 @@ async def run_session(config):
             return
         print(f"✅ Authorized successfully (user {USER_ID[:6]})")
 
-        stake = BASE_STAKE
+        # Start heartbeat task
+        asyncio.create_task(heartbeat(ws))
+
         session_profit = 0.0
         trade_count = 0
-        loss_streak = 0
-        mode = "OVER2"
 
-        # ---------- Trading loop ----------
+        # ----- Main trading loop (new strategy) -----
         while True:
-            # Check profit targets
+            # Check global profit targets
             if session_profit >= TAKE_PROFIT:
                 print(f"✅ Take profit reached: ${session_profit:.2f}")
                 break
             if session_profit <= STOP_LOSS:
                 print(f"🛑 Stop loss hit: ${session_profit:.2f}")
                 break
-            if loss_streak >= 6:
-                print("❌ Too many consecutive losses, stopping.")
-                break
 
-            # ---------- OVER2 trades ----------
-            if mode == "OVER2":
-                cid = await buy(ws, stake, "DIGITOVER", "2")
-                profit = await get_result(ws, cid)
-                session_profit += profit
-                trade_count += 1
-                result_str = "WIN" if profit > 0 else "LOSS"
-                await log_trade(SERVER_URL, USER_ID, SESSION_ID, SYMBOL, stake, profit, result_str)
-                print(f"📊 Trade {trade_count} [{result_str}]: profit ${profit:.2f} | session ${session_profit:.2f} | stake ${stake:.2f}")
+            # 1. Find a symbol that meets the entry conditions
+            name, symbol = await find_entry(ws)
+            print(f"\n🎯 Trading on {name}")
 
-                if profit > 0:
-                    # Reset on win
-                    stake = BASE_STAKE
-                    loss_streak = 0
-                else:
-                    # Loss -> switch to recovery mode and increase stake
-                    stake *= MARTINGALE_MULT
-                    loss_streak += 1
-                    mode = "UNDER6"
+            # 2. First trade (OVER 2) with FIRST_STAKE
+            cid = await buy(ws, FIRST_STAKE, "DIGITOVER", 2)
+            profit = await get_result(ws, cid)
+            session_profit += profit
+            trade_count += 1
+            result_str = "WIN" if profit > 0 else "LOSS"
+            await log_trade(SERVER_URL, USER_ID, SESSION_ID, symbol, FIRST_STAKE, profit, result_str)
+            print(f"📊 Trade {trade_count} [{result_str}]: profit ${profit:.2f} | session ${session_profit:.2f} | stake ${FIRST_STAKE}")
+            if profit > 0:
+                continue   # profit, restart cycle
 
-            # ---------- Recovery trades (UNDER6) ----------
-            elif mode == "UNDER6":
-                for _ in range(3):
-                    cid = await buy(ws, stake, "DIGITUNDER", "6")
-                    profit = await get_result(ws, cid)
-                    session_profit += profit
-                    trade_count += 1
-                    result_str = "WIN" if profit > 0 else "LOSS"
-                    await log_trade(SERVER_URL, USER_ID, SESSION_ID, SYMBOL, stake, profit, result_str)
-                    print(f"🔄 Recovery trade [{result_str}]: profit ${profit:.2f} | session ${session_profit:.2f}")
+            # 3. Second trade (OVER 2) with SECOND_STAKE
+            cid = await buy(ws, SECOND_STAKE, "DIGITOVER", 2)
+            profit = await get_result(ws, cid)
+            session_profit += profit
+            trade_count += 1
+            result_str = "WIN" if profit > 0 else "LOSS"
+            await log_trade(SERVER_URL, USER_ID, SESSION_ID, symbol, SECOND_STAKE, profit, result_str)
+            print(f"📊 Trade {trade_count} [{result_str}]: profit ${profit:.2f} | session ${session_profit:.2f} | stake ${SECOND_STAKE}")
+            if profit > 0:
+                continue   # profit, restart cycle
 
-                    if profit > 0:
-                        # Recovery succeeded
-                        stake = BASE_STAKE
-                        loss_streak = 0
-                        break
-                    else:
-                        # Recovery loss – increase stake and continue
-                        stake *= MARTINGALE_MULT
-                        loss_streak += 1
-                        if loss_streak >= 6:
-                            break
+            # 4. Smart recovery (OVER 4 with increasing stakes)
+            profit, stake_used = await smart_recovery(ws, symbol)
+            session_profit += profit
+            trade_count += 1
+            result_str = "WIN" if profit > 0 else "LOSS"
+            await log_trade(SERVER_URL, USER_ID, SESSION_ID, symbol, stake_used, profit, result_str)
+            print(f"🔄 Recovery trade [{result_str}]: profit ${profit:.2f} | session ${session_profit:.2f}")
 
-                # Always go back to OVER2 after recovery attempts
-                mode = "OVER2"
+            # Continue the cycle (will re‑scan for a new entry)
 
         print(f"🏁 Session finished. Final profit: ${session_profit:.2f}")
 
-# ---------- Wrapper with auto‑reconnect ----------
+# ---------- Heartbeat ----------
+async def heartbeat(ws):
+    while True:
+        try:
+            print("❤️ Bot Alive")
+            await send(ws, {"ping": 1})
+            await asyncio.sleep(30)
+        except:
+            break
+
+# ---------- Auto‑reconnect wrapper (unchanged) ----------
 async def main():
     config_str = sys.stdin.read()
     if not config_str:
@@ -178,7 +269,6 @@ async def main():
         return
     config = json.loads(config_str)
 
-    # Keep reconnecting if the connection drops
     while True:
         try:
             await run_session(config)
