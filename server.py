@@ -94,11 +94,15 @@ def get_balance():
         output = proc.stdout.strip()
         if proc.returncode == 0 and output:
             try:
-                balance = float(output)
+                result = json.loads(output)
+                balance = result.get("balance", -1)
+                loginid = result.get("loginid")
                 if balance < 0:
                     return cors_response({"error": "Invalid token or authorization failed"}, 401)
-                return cors_response({"balance": balance})
-            except ValueError:
+                # Determine account type
+                account_type = "demo" if loginid and loginid.startswith("VRTC") else "real" if loginid and loginid.startswith("CR") else "unknown"
+                return cors_response({"balance": balance, "account_type": account_type, "loginid": loginid})
+            except json.JSONDecodeError:
                 return cors_response({"error": "Unexpected output: " + output}, 500)
         else:
             err = proc.stderr.strip() or "balance_check.py returned no output"
@@ -119,6 +123,7 @@ def start_bot():
     user_id  = data.get("userId")
     token    = data.get("token")
     settings = data.get("settings", {})
+    strategy = settings.get("strategy", "smart_scan")   # new field
 
     if not user_id or not token:
         return cors_response({"status": "Missing userId or token"}, 400)
@@ -171,6 +176,7 @@ def start_bot():
         "martingaleMult": martingale_mult,
         "takeProfit":     take_profit,
         "stopLoss":       stop_loss,
+        "strategy":       strategy,
         "serverUrl":      request.host_url.rstrip('/')
     })
 
@@ -183,14 +189,12 @@ def start_bot():
             text=True,
             bufsize=1  # line buffered
         )
-        # Write config and close stdin immediately — don't block
         proc.stdin.write(bot_input)
         proc.stdin.flush()
         proc.stdin.close()
 
         running_bots[user_id] = proc
 
-        # Monitor output in background thread
         t = threading.Thread(target=log_bot_output, args=(proc, user_id), daemon=True)
         t.start()
 
