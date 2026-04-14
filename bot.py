@@ -516,6 +516,132 @@ async def strategy_simple_over2(ws, config, session_profit, trade_count):
 
     return session_profit, trade_count
 
+# ================= STRATEGY 5: SMART SCAN ENHANCED (OVER5 Recovery) =================
+async def strategy_smart_scan_enhanced(ws, config, session_profit, trade_count):
+    BASE_STAKE = config["baseStake"]
+    MARTINGALE_MULT = config["martingaleMult"]
+    TAKE_PROFIT = config["takeProfit"]
+    STOP_LOSS = config["stopLoss"]
+    SERVER_URL = config["serverUrl"]
+    USER_ID = config["userId"]
+    SESSION_ID = config["sessionId"]
+    SYMBOLS = {
+        "V10": "1HZ10V",
+        "V25": "1HZ25V",
+        "V50": "1HZ50V",
+        "V75": "1HZ75V",
+        "V100": "1HZ100V"
+    }
+
+    # Strategy-specific parameters (as in your code)
+    STUDY_TICKS = 25
+    MIN_THRESHOLD = 0.76
+    MAX_THRESHOLD = 0.90
+    MOMENTUM_TICKS = 4
+    PRESSURE_TICKS = 6
+
+    def last_digit(price):
+        return int(str(price).replace(".", "")[-1])
+
+    async def get_tick(ws):
+        while True:
+            msg = await wait_msg(ws, "tick")
+            try:
+                return msg["tick"]["quote"]
+            except:
+                continue
+
+    async def study_symbol(ws, symbol):
+        await send(ws, {"ticks": symbol, "subscribe": 1})
+        digits = []
+        while len(digits) < STUDY_TICKS:
+            quote = await get_tick(ws)
+            digits.append(last_digit(quote))
+        await send(ws, {"forget_all": "ticks"})
+        over2 = sum(1 for d in digits if d > 2)
+        percent = over2 / STUDY_TICKS
+        return percent, digits
+
+    def check_momentum(digits):
+        last = digits[-MOMENTUM_TICKS:]
+        return sum(1 for d in last if d > 2) >= 2   # weaker momentum
+
+    def digit_pressure(digits):
+        sample = digits[-PRESSURE_TICKS:]
+        over = sum(1 for d in sample if d > 4)   # pressure based on >4
+        under = sum(1 for d in sample if d <= 4)
+        return over, under
+
+    async def find_entry(ws):
+        print("\n🔍 Scanning Market (Enhanced)...")
+        while True:
+            for name, symbol in SYMBOLS.items():
+                percent, digits = await study_symbol(ws, symbol)
+                momentum = check_momentum(digits)
+                over, under = digit_pressure(digits)
+                print("\n" + "="*40)
+                print(f"📊 SYMBOL: {name}")
+                print(f"📈 Strength: {percent*100:.2f}%")
+                print(f"⚡ Momentum: {'✅' if momentum else '❌'}")
+                print(f"🔥 >4 Pressure: {over}")
+                print(f"❄️ ≤4 Pressure: {under}")
+                print("="*40)
+                if MIN_THRESHOLD <= percent <= MAX_THRESHOLD and momentum and over > under:
+                    print(f"🚀 ENTRY → {name}")
+                    return name, symbol
+            print("⏳ No setup → rescanning...\n")
+            await asyncio.sleep(1)
+
+    stake = BASE_STAKE
+    while True:
+        if session_profit >= TAKE_PROFIT:
+            print(f"✅ Take profit reached: ${session_profit:.2f}")
+            break
+        if session_profit <= STOP_LOSS:
+            print(f"🛑 Stop loss hit: ${session_profit:.2f}")
+            break
+
+        name, symbol = await find_entry(ws)
+        print(f"\n🎯 Trading on {name}")
+
+        # FIRST TRADE (OVER 2)
+        cid = await buy(ws, stake, "DIGITOVER", 2, symbol)
+        profit = await get_result(ws, cid)
+        session_profit += profit
+        trade_count += 1
+        await log_trade(SERVER_URL, USER_ID, SESSION_ID, symbol, stake, profit, "WIN" if profit > 0 else "LOSS")
+        print(f"📊 Trade {trade_count}: profit ${profit:.2f} | session ${session_profit:.2f} | stake ${stake}")
+        if profit > 0:
+            continue
+
+        # SECOND TRADE (OVER 5) – note: barrier 5
+        stake2 = stake  # as per your SECOND_STAKE = FIRST_STAKE
+        cid = await buy(ws, stake2, "DIGITOVER", 5, symbol)
+        profit = await get_result(ws, cid)
+        session_profit += profit
+        trade_count += 1
+        await log_trade(SERVER_URL, USER_ID, SESSION_ID, symbol, stake2, profit, "WIN" if profit > 0 else "LOSS")
+        print(f"📊 Trade {trade_count}: profit ${profit:.2f} | session ${session_profit:.2f} | stake ${stake2}")
+        if profit > 0:
+            continue
+
+        # RECOVERY (OVER 5) with increasing stake
+        recovery_stake = stake2 * MARTINGALE_MULT
+        print("🧠 Smart Recovery Mode (OVER 5)")
+        for i in range(8):
+            print(f"🛠 Recovery {i+1} | Stake: {recovery_stake}")
+            cid = await buy(ws, recovery_stake, "DIGITOVER", 5, symbol)
+            profit = await get_result(ws, cid)
+            session_profit += profit
+            trade_count += 1
+            await log_trade(SERVER_URL, USER_ID, SESSION_ID, symbol, recovery_stake, profit, "WIN" if profit > 0 else "LOSS")
+            if profit > 0:
+                print("✅ Recovery win\n")
+                break
+            recovery_stake *= MARTINGALE_MULT
+
+    return session_profit, trade_count
+
 # ================= MAIN WRAPPER WITH STRATEGY SELECTION =================
 async def run_session(config):
     TOKEN = config["token"]
@@ -556,6 +682,8 @@ async def run_session(config):
             session_profit, trade_count = await strategy_adaptive_recovery(ws, config, session_profit, trade_count)
         elif STRATEGY == "simple_over2":
             session_profit, trade_count = await strategy_simple_over2(ws, config, session_profit, trade_count)
+        elif STRATEGY == "smart_scan_enhanced":
+            session_profit, trade_count = await strategy_smart_scan_enhanced(ws, config, session_profit, trade_count)
         else:
             print(f"Unknown strategy: {STRATEGY}", file=sys.stderr)
             return
