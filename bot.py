@@ -516,10 +516,10 @@ async def strategy_simple_over2(ws, config, session_profit, trade_count):
 
     return session_profit, trade_count
 
-# ================= STRATEGY 5: SMART SCAN ENHANCED (OVER5 Recovery) =================
+# ================= STRATEGY 5: SMART SCAN ENHANCED (OVER5 Recovery) - NO HARDCODED STAKES =================
 async def strategy_smart_scan_enhanced(ws, config, session_profit, trade_count):
-    BASE_STAKE = config["baseStake"]
-    MARTINGALE_MULT = config["martingaleMult"]
+    BASE_STAKE = config["baseStake"]           # user sets this in website
+    MARTINGALE_MULT = config["martingaleMult"] # user sets this in website
     TAKE_PROFIT = config["takeProfit"]
     STOP_LOSS = config["stopLoss"]
     SERVER_URL = config["serverUrl"]
@@ -533,7 +533,7 @@ async def strategy_smart_scan_enhanced(ws, config, session_profit, trade_count):
         "V100": "1HZ100V"
     }
 
-    # Strategy-specific parameters (as in your code)
+    # Strategy-specific parameters (these are not stake/martingale)
     STUDY_TICKS = 25
     MIN_THRESHOLD = 0.76
     MAX_THRESHOLD = 0.90
@@ -564,11 +564,11 @@ async def strategy_smart_scan_enhanced(ws, config, session_profit, trade_count):
 
     def check_momentum(digits):
         last = digits[-MOMENTUM_TICKS:]
-        return sum(1 for d in last if d > 2) >= 2   # weaker momentum
+        return sum(1 for d in last if d > 2) >= 2   # exactly as your original
 
     def digit_pressure(digits):
         sample = digits[-PRESSURE_TICKS:]
-        over = sum(1 for d in sample if d > 4)   # pressure based on >4
+        over = sum(1 for d in sample if d > 4)
         under = sum(1 for d in sample if d <= 4)
         return over, under
 
@@ -592,7 +592,10 @@ async def strategy_smart_scan_enhanced(ws, config, session_profit, trade_count):
             print("⏳ No setup → rescanning...\n")
             await asyncio.sleep(1)
 
-    stake = BASE_STAKE
+    stake = BASE_STAKE       # directly from user settings
+    stake2 = stake           # second stake = same as first (your original behavior)
+    recovery_steps = 8       # fixed as per your original
+
     while True:
         if session_profit >= TAKE_PROFIT:
             print(f"✅ Take profit reached: ${session_profit:.2f}")
@@ -614,8 +617,7 @@ async def strategy_smart_scan_enhanced(ws, config, session_profit, trade_count):
         if profit > 0:
             continue
 
-        # SECOND TRADE (OVER 5) – note: barrier 5
-        stake2 = stake  # as per your SECOND_STAKE = FIRST_STAKE
+        # SECOND TRADE (OVER 5)
         cid = await buy(ws, stake2, "DIGITOVER", 5, symbol)
         profit = await get_result(ws, cid)
         session_profit += profit
@@ -625,10 +627,10 @@ async def strategy_smart_scan_enhanced(ws, config, session_profit, trade_count):
         if profit > 0:
             continue
 
-        # RECOVERY (OVER 5) with increasing stake
+        # RECOVERY (OVER 5) with increasing stake using user's martingale multiplier
         recovery_stake = stake2 * MARTINGALE_MULT
         print("🧠 Smart Recovery Mode (OVER 5)")
-        for i in range(8):
+        for i in range(recovery_steps):
             print(f"🛠 Recovery {i+1} | Stake: {recovery_stake}")
             cid = await buy(ws, recovery_stake, "DIGITOVER", 5, symbol)
             profit = await get_result(ws, cid)
